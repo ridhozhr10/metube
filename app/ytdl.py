@@ -68,11 +68,21 @@ class Download:
         self.proc = None
         self.loop = None
         self.notifier = None
-        s3 = boto3.client('s3', region_name='ap-southeast-3')
-        endpointUrl = s3.meta.endpoint_url
-        s3 = boto3.client('s3', endpoint_url=endpointUrl,
-                          region_name='ap-southeast-3')
-        self.s3 = s3
+
+        self.useS3 = False
+        if (os.environ.get("AWS_ACCESS_KEY_ID")):
+            s3 = boto3.client('s3',
+                              region_name=os.environ.get("REGION_NAME"),
+                              aws_access_key_id=os.environ.get(
+                                  "AWS_ACCESS_KEY_ID"),
+                              aws_secret_access_key=os.environ.get(
+                                  "AWS_SECRET_ACCESS_KEY")
+                              )
+            endpointUrl = s3.meta.endpoint_url
+            s3 = boto3.client('s3', endpoint_url=endpointUrl,
+                              region_name=os.environ.get("REGION_NAME"))
+            self.s3 = s3
+            self.useS3 = True
 
     def _download(self):
         try:
@@ -96,10 +106,13 @@ class Download:
                             d['info_dict']['__finaldir'], os.path.basename(d['info_dict']['filepath']))
                     else:
                         filename = d['info_dict']['filepath']
-                    url = upload_s3(d)
+
+                    if self.useS3:
+                        url = upload_s3(d)
+                        self.status_queue.put({'downloadURL': url})
+
                     self.status_queue.put(
-                        {'status': 'finished', 'filename': filename, 'downloadURL': url})
-                    # hook next
+                        {'status': 'finished', 'filename': filename})
 
             def upload_s3(d):
                 if '__finaldir' in d['info_dict']:
@@ -134,7 +147,7 @@ class Download:
                     file_url = get_file_url()
                     log.info("success generate url: %s" % (file_url))
                     return file_url
-            print("self.info.url = %s" % self.info.url)
+
             ret = yt_dlp.YoutubeDL(params={
                 'quiet': True,
                 'no_color': True,
@@ -202,9 +215,11 @@ class Download:
                 if (self.info.format == 'thumbnail'):
                     self.info.filename = re.sub(
                         r'\.webm$', '.jpg', self.info.filename)
+
             if 'downloadURL' in status:
                 self.info.downloadURL = status['downloadURL']
-            self.info.status = status['status']
+
+            self.info.status = status.get('status')
             self.info.msg = status.get('msg')
             if 'downloaded_bytes' in status:
                 total = status.get('total_bytes') or status.get(

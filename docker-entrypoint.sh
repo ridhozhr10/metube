@@ -3,6 +3,7 @@
 echo "Setting umask to ${UMASK}"
 umask ${UMASK}
 echo "Creating download directory (${DOWNLOAD_DIR}), state directory (${STATE_DIR}), and temp dir (${TEMP_DIR})"
+echo "AWS Config region=(${REGION_NAME}), access key (${AWS_ACCESS_KEY_ID}), and temp dir (${AWS_SECRET_ACCESS_KEY})"
 mkdir -p "${DOWNLOAD_DIR}" "${STATE_DIR}" "${TEMP_DIR}"
 
 if [ `id -u` -eq 0 ] && [ `id -g` -eq 0 ]; then
@@ -10,7 +11,7 @@ if [ `id -u` -eq 0 ] && [ `id -g` -eq 0 ]; then
         echo "Warning: it is not recommended to run as root user, please check your setting of the UID environment variable"
     fi
     echo "Changing ownership of download and state directories to ${UID}:${GID}"
-    chown -R "${UID}":"${GID}" /app "${DOWNLOAD_DIR}" "${STATE_DIR}" "${TEMP_DIR}"
+    chown -R "${UID}":"${GID}" /app "${DOWNLOAD_DIR}" "${STATE_DIR}" "${TEMP_DIR}"  
     echo "Running MeTube as user ${UID}:${GID}"
     su-exec "${UID}":"${GID}" python3 app/main.py
 else
