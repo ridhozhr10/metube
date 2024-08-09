@@ -6,9 +6,15 @@
     "configurations": [
         {
             "name": "Python: MeTube",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/app/main.py",
+            "linux": {
+                "env": {
+                    "DOWNLOAD_DIR": "${workspaceFolder}/Downloads",
+                    "STATE_DIR": "${workspaceFolder}/Temp",
+                }
+            },
             "windows": {
                 "env": {
                     "DOWNLOAD_DIR": "${env:USERPROFILE}/Downloads",

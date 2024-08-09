@@ -9,8 +9,11 @@ import logging
 import re
 from dl_formats import get_format, get_opts, AUDIO_FORMATS
 from datetime import datetime
+import boto3
+from botocore.exceptions import ClientError
 
 log = logging.getLogger('ytdl')
+
 
 class DownloadQueueNotifier:
     async def added(self, dl):
@@ -28,10 +31,13 @@ class DownloadQueueNotifier:
     async def cleared(self, id):
         raise NotImplementedError
 
+
 class DownloadInfo:
     def __init__(self, id, title, url, quality, format, folder, custom_name_prefix, error):
-        self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
-        self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
+        self.id = id if len(
+            custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
+        self.title = title if len(
+            custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
         self.url = url
         self.quality = quality
         self.format = format
@@ -41,7 +47,9 @@ class DownloadInfo:
         self.status = "pending"
         self.size = None
         self.timestamp = time.time_ns()
+        self.downloadURL = ''
         self.error = error
+
 
 class Download:
     manager = None
@@ -60,7 +68,11 @@ class Download:
         self.proc = None
         self.loop = None
         self.notifier = None
-
+        s3 = boto3.client('s3', region_name='ap-southeast-3')
+        endpointUrl = s3.meta.endpoint_url
+        s3 = boto3.client('s3', endpoint_url=endpointUrl,
+                          region_name='ap-southeast-3')
+        self.s3 = s3
 
     def _download(self):
         try:
@@ -76,19 +88,59 @@ class Download:
                     'speed',
                     'eta',
                 )})
+
             def put_status_postprocessor(d):
                 if d['postprocessor'] == 'MoveFiles' and d['status'] == 'finished':
                     if '__finaldir' in d['info_dict']:
-                        filename = os.path.join(d['info_dict']['__finaldir'], os.path.basename(d['info_dict']['filepath']))
+                        filename = os.path.join(
+                            d['info_dict']['__finaldir'], os.path.basename(d['info_dict']['filepath']))
                     else:
                         filename = d['info_dict']['filepath']
-                    self.status_queue.put({'status': 'finished', 'filename': filename})
+                    url = upload_s3(d)
+                    self.status_queue.put(
+                        {'status': 'finished', 'filename': filename, 'downloadURL': url})
+                    # hook next
+
+            def upload_s3(d):
+                if '__finaldir' in d['info_dict']:
+                    filename = os.path.join(
+                        d['info_dict']['__finaldir'], os.path.basename(d['info_dict']['filepath']))
+                else:
+                    filename = d['info_dict']['filepath']
+
+                bucket_name = 'metube-ridhozhr10-2024'
+                s3path = os.path.basename(d['info_dict']['filepath'])
+
+                def upload_file():
+                    try:
+                        self.s3.upload_file(filename, bucket_name, s3path)
+                    except ClientError as e:
+                        log.error("failed to upload s3: %s" % (e))
+                        return False
+                    return True
+
+                def get_file_url():
+                    try:
+                        url = self.s3.generate_presigned_url(
+                            'get_object', Params={'Bucket': bucket_name, 'Key': s3path}, ExpiresIn=3600)
+                    except ClientError as e:
+                        log.error("failed to generate url: %s" % (e))
+                        return ''
+
+                    return url
+
+                if upload_file():
+                    log.info("success upload to s3: %s" % (s3path))
+                    file_url = get_file_url()
+                    log.info("success generate url: %s" % (file_url))
+                    return file_url
+            print("self.info.url = %s" % self.info.url)
             ret = yt_dlp.YoutubeDL(params={
                 'quiet': True,
                 'no_color': True,
-                #'skip_download': True,
+                # 'skip_download': True,
                 'paths': {"home": self.download_dir, "temp": self.temp_dir},
-                'outtmpl': { "default": self.output_template, "chapter": self.output_template_chapter },
+                'outtmpl': {"default": self.output_template, "chapter": self.output_template_chapter},
                 'format': self.format,
                 'socket_timeout': 30,
                 'ignore_no_formats_error': True,
@@ -96,7 +148,8 @@ class Download:
                 'postprocessor_hooks': [put_status_postprocessor],
                 **self.ytdl_opts,
             }).download([self.info.url])
-            self.status_queue.put({'status': 'finished' if ret == 0 else 'error'})
+            self.status_queue.put(
+                {'status': 'finished' if ret == 0 else 'error'})
         except yt_dlp.utils.YoutubeDLError as exc:
             self.status_queue.put({'status': 'error', 'msg': str(exc)})
 
@@ -140,21 +193,29 @@ class Download:
             self.tmpfilename = status.get('tmpfilename')
             if 'filename' in status:
                 fileName = status.get('filename')
-                self.info.filename = os.path.relpath(fileName, self.download_dir)
-                self.info.size = os.path.getsize(fileName) if os.path.exists(fileName) else None
+                self.info.filename = os.path.relpath(
+                    fileName, self.download_dir)
+                self.info.size = os.path.getsize(
+                    fileName) if os.path.exists(fileName) else None
 
                 # Set correct file extension for thumbnails
-                if(self.info.format == 'thumbnail'):
-                    self.info.filename = re.sub(r'\.webm$', '.jpg', self.info.filename)
+                if (self.info.format == 'thumbnail'):
+                    self.info.filename = re.sub(
+                        r'\.webm$', '.jpg', self.info.filename)
+            if 'downloadURL' in status:
+                self.info.downloadURL = status['downloadURL']
             self.info.status = status['status']
             self.info.msg = status.get('msg')
             if 'downloaded_bytes' in status:
-                total = status.get('total_bytes') or status.get('total_bytes_estimate')
+                total = status.get('total_bytes') or status.get(
+                    'total_bytes_estimate')
                 if total:
-                    self.info.percent = status['downloaded_bytes'] / total * 100
+                    self.info.percent = status['downloaded_bytes'] / \
+                        total * 100
             self.info.speed = status.get('speed')
             self.info.eta = status.get('eta')
             await self.notifier.updated(self.info)
+
 
 class PersistentQueue:
     def __init__(self, path):
@@ -201,6 +262,7 @@ class PersistentQueue:
     def empty(self):
         return not bool(self.dict)
 
+
 class DownloadQueue:
     def __init__(self, config, notifier):
         self.config = config
@@ -236,11 +298,13 @@ class DownloadQueue:
             Tuple dldirectory, error_message both of which might be None (but not at the same time)
         """
         # Keep consistent with frontend
-        base_directory = self.config.DOWNLOAD_DIR if (quality != 'audio' and format not in AUDIO_FORMATS) else self.config.AUDIO_DOWNLOAD_DIR
+        base_directory = self.config.DOWNLOAD_DIR if (
+            quality != 'audio' and format not in AUDIO_FORMATS) else self.config.AUDIO_DOWNLOAD_DIR
         if folder:
             if not self.config.CUSTOM_DIRS:
                 return None, {'status': 'error', 'msg': f'A folder for the download was specified but CUSTOM_DIRS is not true in the configuration.'}
-            dldirectory = os.path.realpath(os.path.join(base_directory, folder))
+            dldirectory = os.path.realpath(
+                os.path.join(base_directory, folder))
             real_base_directory = os.path.realpath(base_directory)
             if not dldirectory.startswith(real_base_directory):
                 return None, {'status': 'error', 'msg': f'Folder "{folder}" must resolve inside the base download directory "{real_base_directory}"'}
@@ -258,7 +322,8 @@ class DownloadQueue:
 
         error = None
         if "live_status" in entry and "release_timestamp" in entry and entry.get("live_status") == "is_upcoming":
-            dt_ts = datetime.fromtimestamp(entry.get("release_timestamp")).strftime('%Y-%m-%d %H:%M:%S %z')
+            dt_ts = datetime.fromtimestamp(
+                entry.get("release_timestamp")).strftime('%Y-%m-%d %H:%M:%S %z')
             error = f"Live stream is scheduled to start at {dt_ts}"
         else:
             if "msg" in entry:
@@ -272,7 +337,8 @@ class DownloadQueue:
             results = []
             for index, etr in enumerate(entries, start=1):
                 etr["playlist"] = entry["id"]
-                etr["playlist_index"] = '{{0:0{0:d}d}}'.format(playlist_index_digits).format(index)
+                etr["playlist_index"] = '{{0:0{0:d}d}}'.format(
+                    playlist_index_digits).format(index)
                 for property in ("id", "title", "uploader", "uploader_id"):
                     if property in entry:
                         etr[f"playlist_{property}"] = entry[property]
@@ -282,20 +348,25 @@ class DownloadQueue:
             return {'status': 'ok'}
         elif etype == 'video' or etype.startswith('url') and 'id' in entry and 'title' in entry:
             if not self.queue.exists(entry['id']):
-                dl = DownloadInfo(entry['id'], entry['title'], entry.get('webpage_url') or entry['url'], quality, format, folder, custom_name_prefix, error)
-                dldirectory, error_message = self.__calc_download_path(quality, format, folder)
+                dl = DownloadInfo(entry['id'], entry['title'], entry.get(
+                    'webpage_url') or entry['url'], quality, format, folder, custom_name_prefix, error)
+                dldirectory, error_message = self.__calc_download_path(
+                    quality, format, folder)
                 if error_message is not None:
                     return error_message
-                output = self.config.OUTPUT_TEMPLATE if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{self.config.OUTPUT_TEMPLATE}'
+                output = self.config.OUTPUT_TEMPLATE if len(
+                    custom_name_prefix) == 0 else f'{custom_name_prefix}.{self.config.OUTPUT_TEMPLATE}'
                 output_chapter = self.config.OUTPUT_TEMPLATE_CHAPTER
                 for property, value in entry.items():
                     if property.startswith("playlist"):
                         output = output.replace(f"%({property})s", str(value))
                 if auto_start is True:
-                    self.queue.put(Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, self.config.YTDL_OPTIONS, dl))
+                    self.queue.put(Download(dldirectory, self.config.TEMP_DIR, output,
+                                   output_chapter, quality, format, self.config.YTDL_OPTIONS, dl))
                     self.event.set()
                 else:
-                    self.pending.put(Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, quality, format, self.config.YTDL_OPTIONS, dl))
+                    self.pending.put(Download(dldirectory, self.config.TEMP_DIR, output,
+                                     output_chapter, quality, format, self.config.YTDL_OPTIONS, dl))
                 await self.notifier.added(dl)
             return {'status': 'ok'}
         elif etype.startswith('url'):
@@ -303,7 +374,8 @@ class DownloadQueue:
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}
 
     async def add(self, url, quality, format, folder, custom_name_prefix, auto_start=True, already=None):
-        log.info(f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=}')
+        log.info(
+            f'adding {url}: {quality=} {format=} {already=} {folder=} {custom_name_prefix=}')
         already = set() if already is None else already
         if url in already:
             log.info('recursion detected, skipping')
@@ -351,17 +423,19 @@ class DownloadQueue:
             if self.config.DELETE_FILE_ON_TRASHCAN:
                 dl = self.done.get(id)
                 try:
-                    dldirectory, _ = self.__calc_download_path(dl.info.quality, dl.info.format, dl.info.folder)
+                    dldirectory, _ = self.__calc_download_path(
+                        dl.info.quality, dl.info.format, dl.info.folder)
                     os.remove(os.path.join(dldirectory, dl.info.filename))
                 except Exception as e:
-                    log.warn(f'deleting file for download {id} failed with error message {e!r}')
+                    log.warn(
+                        f'deleting file for download {id} failed with error message {e!r}')
             self.done.delete(id)
             await self.notifier.cleared(id)
         return {'status': 'ok'}
 
     def get(self):
-        return(list((k, v.info) for k, v in self.queue.items()) + list((k, v.info) for k, v in self.pending.items()),
-               list((k, v.info) for k, v in self.done.items()))
+        return (list((k, v.info) for k, v in self.queue.items()) + list((k, v.info) for k, v in self.pending.items()),
+                list((k, v.info) for k, v in self.done.items()))
 
     async def __download(self):
         while True:
